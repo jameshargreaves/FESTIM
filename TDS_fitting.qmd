@@ -1,0 +1,280 @@
+---
+title: "TDS fitting"
+format:
+  html:
+    code-fold: true
+jupyter: python3
+---
+
+# Introduction
+Based on https://festim-workshop.readthedocs.io/en/festim2/content/applications/task10.html, which implements https://doi.org/10.1016/j.nme.2021.100984.
+
+A dummy TDS spectrum with artifical experimental noise is generated. Based on an initial guess, FESTIM simulations are conducted iteratively and compared against the dummy spectrum until a pre-defined error threshold is reached.
+
+# Setup: define temperature and TDS functions
+```{python}
+#| output: false
+
+# Import modules
+import festim as F
+import h_transport_materials as htm
+import numpy as np
+import sympy as sp
+
+# Define global constants
+avogadro = 6.02214076e23  # 1/mol
+
+# Define temperature function
+def temperature(t):
+    ramp = 5  # K/s
+    return 300 + ramp * t
+
+# Define TDS function
+def TDS(n, E_p):
+    """Runs the simulation with parameters p that represent:
+
+    Args:
+        n (float): concentration of trap 1, at. fr.
+        E_p (float): detrapping barrier from trap 1, eV
+
+    Returns:
+        F.DerivedQuantities: the derived quantities of the simulation
+    """
+    w_atom_density = 6.3e28 / avogadro # mol/m3
+    trap_conc = n * w_atom_density
+
+    # Create simulation object & define species
+    synthetic_TDS = F.HydrogenTransportProblem()
+
+    H = F.Species("H")
+    trapped_species = F.Species("H_trapped", mobile=False)
+    synthetic_TDS.species = [H, trapped_species]
+    
+    # Define a simple mesh
+    vertices = np.linspace(0, 20e-6, num=200)
+    synthetic_TDS.mesh = F.Mesh1D(vertices)
+    
+    # Define material properties & traps/reactions
+    
+    D = (
+    htm.diffusivities.filter(material="tungsten")
+    .filter(isotope="h")
+    .filter(author="fernandez")[0]
+    )
+    
+    tungsten = F.Material(
+        D_0=D.pre_exp.magnitude,
+        E_D=D.act_energy.magnitude,
+    )
+
+    boundary_left = F.SurfaceSubdomain1D(id=1, x=0)
+    boundary_right = F.SurfaceSubdomain1D(id=2, x=20e-6)
+    volume_subdomain = F.VolumeSubdomain1D(id=3, borders=[0, 20e-6], material=tungsten)
+    synthetic_TDS.subdomains = [boundary_left, boundary_right, volume_subdomain]
+
+    empty_trap = F.ImplicitSpecies(
+        n=trap_conc,
+        others=[trapped_species],
+    )
+
+    trap_1_reaction = F.Reaction(
+        reactant=[H, empty_trap],
+        product=[trapped_species],
+        k_0=D.pre_exp.magnitude / (1.1e-10**2 * 6 * w_atom_density),
+        E_k=D.act_energy.magnitude,
+        p_0=1e13,
+        E_p=E_p,
+        volume=volume_subdomain,
+    )
+
+    synthetic_TDS.reactions = [trap_1_reaction]
+    
+    # Define initial & boundary conditions
+    synthetic_TDS.initial_conditions = [
+        F.InitialConcentration(species=trapped_species, value=trap_conc, volume=volume_subdomain),
+    ]
+
+    synthetic_TDS.boundary_conditions = [
+        F.FixedConcentrationBC(subdomain=surf, value=0, species=H)
+        for surf in [boundary_left, boundary_right]
+    ]
+
+    # Define the material temperature evolution
+    synthetic_TDS.temperature = temperature
+
+    # Define the simulation/solver settings
+    synthetic_TDS.settings = F.Settings(
+        atol=1e-10,
+        rtol=1e-10,
+        final_time=140,
+        max_iterations=50,
+    )
+
+    synthetic_TDS.settings.stepsize = F.Stepsize(
+        initial_value=0.01,
+        growth_factor=1.2,
+        cutback_factor=0.9,
+        target_nb_iterations=4,
+        max_stepsize=lambda t: None if t < 1 else 1,
+    )
+
+    # Define derived quantities/outputs
+    fluxes = [
+        F.SurfaceFlux(field=H, surface=boundary_left),
+        F.SurfaceFlux(field=H, surface=boundary_right),
+    ]
+
+    synthetic_TDS.exports = fluxes
+
+    # Initialise & run
+    synthetic_TDS.initialise()
+    synthetic_TDS.run()
+
+    return fluxes
+```
+
+# Generate & display dummy TDS spectrum
+
+```{python}
+
+reference_prms = [1e-2, 1.0]
+data = TDS(*reference_prms)
+
+import matplotlib.pyplot as plt
+
+
+# Calculate the total desorption flux
+flux_left = data[0].data
+flux_right = data[1].data
+flux_total = np.array(flux_left) + np.array(flux_right)
+
+# Get temperature
+T = temperature(np.array(data[0].t))
+
+# Add random noise
+noise = np.random.normal(0, 0.05 * max(flux_total), len(flux_total))
+noisy_flux = flux_total + noise
+
+# Save to file
+np.savetxt("Noisy_TDS.csv", np.column_stack([T, noisy_flux]), delimiter=";", fmt="%f")
+
+# Visualise
+plt.plot(T, noisy_flux, linewidth=2)
+
+plt.ylabel(r"Desorption flux (mol m$^{-2}$ s$^{-1}$)")
+plt.xlabel(r"Temperature (K)")
+plt.show()
+
+```
+
+# Define fitting functions
+```{python}
+#| output: false
+from scipy.interpolate import interp1d
+
+ref = np.genfromtxt("Noisy_TDS.csv", delimiter=";")
+
+
+def info(xk):
+    """
+    Print information during the fitting procedure
+    """
+    print("-" * 40)
+    print("New iteration.")
+    print(f"Point is: {xk}")
+
+prms = []
+errors = []
+
+all_ts = []
+all_fluxes = []
+
+i = 0  # initialise counter
+
+
+def error_function(prm):
+    """
+    Compute average absolute error between simulation and reference
+    """
+    global i
+    global prms
+    global errors
+    global all_ts
+    global all_fluxes
+
+    i += 1
+    prms.append(prm)
+
+    # Filter the results if a negative value is found
+    if any([e < 0 for e in prm]):
+        return 1e30
+
+    # Get the simulation result
+    n, Ep = prm
+    res = TDS(n, Ep)
+
+    flux = np.array(res[0].data) + np.array(res[1].data)
+    all_fluxes.append(flux)
+    all_ts.append(np.array(res[0].t))
+
+    T = temperature(np.array(res[0].t))
+
+    interp_tds = interp1d(T, flux, fill_value="extrapolate")
+
+    # Compute the mean absolute error between sim and ref
+    err = np.abs(interp_tds(ref[:, 0]) - ref[:, 1]).mean()
+
+    print(f"Average absolute error is : {err:.2e}")
+    errors.append(err)
+    return err
+```
+
+# Peform fitting
+```{python}
+#| output: false
+from scipy.optimize import minimize
+
+
+# Set the tolerances
+fatol = 3e18
+xatol = 1e-2
+
+initial_guess = [2e-2, 1.1]
+
+# Minimise the error function
+res = minimize(
+    error_function,
+    np.array(initial_guess),
+    method="Nelder-Mead",
+    options={"disp": True, "fatol": fatol, "xatol": xatol},
+    callback=info,
+)
+```
+
+# Plot results
+```{python}
+# Process the obtained results
+predicted_data = TDS(*res.x)
+
+T = temperature(np.array(predicted_data[0].t))
+
+flux_left = predicted_data[0].data
+flux_right = predicted_data[1].data
+flux_total = np.array(flux_left) + np.array(flux_right)
+
+for i, (t, flux) in enumerate(zip(all_ts, all_fluxes)):
+    T = temperature(t)
+    if i == 0:
+        plt.plot(T, flux, color="tab:red", lw=2, label="Initial guess")
+    else:
+        plt.plot(T, flux, color="tab:grey", lw=0.5)
+
+plt.plot(ref[:, 0], ref[:, 1], linewidth=2, label="Reference")
+plt.plot(T, flux_total, linewidth=2, label="Optimised")
+
+plt.ylabel(r"Desorption flux (mol m$^{-2}$ s$^{-1}$)")
+plt.xlabel(r"Temperature (K)")
+plt.legend()
+plt.show()
+```
+
