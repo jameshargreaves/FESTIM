@@ -4,6 +4,9 @@ format:
   html:
     code-fold: true
 jupyter: python3
+execute:
+  cwd: document
+bibliography: bibliography.bib
 ---
 
 # Introduction
@@ -11,23 +14,141 @@ Based on https://festim-workshop.readthedocs.io/en/festim2/content/applications/
 
 A dummy TDS spectrum with artifical experimental noise is generated. Based on an initial guess, FESTIM simulations are conducted iteratively and compared against the dummy spectrum until a pre-defined error threshold is reached.
 
-# Setup: define temperature and TDS functions
+# Setup
+## H/D/T in W diffusivity
+ Arrehenius law diffusivity coefficents for H/D/T in W are taken from the hydrogen transport in materials (HTM) database [@delaporte-mathurin_remdelaportemathurinh-transport-materials_2023]. This compiles experimental, molecular dynamics (MD), and density functional theory (DFT) modelling literature data. Significant scatter is observed across HTM's 24 literature datasets for H/D/T diffusion in W:
+
+```{python}
+
+import h_transport_materials as htm
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# Query data from HTM
+filtered_diffusivity = (
+    htm.diffusivities.filter(material=['tungsten'])
+    .filter(author=['byeon', 'esteban', 'fernandez', 'frauenfelder', 'heinola', 'holzner', 'ikeda', 'johnson', 'liu', 'moore', 'otsuka', 'ryabchikov', 'zakharov', 'zhao', 'zhou'])
+    .filter(isotope=['h', 'd', 't'])
+    .filter(year=np.arange(1957, 2024, step=1).tolist())
+)
+
+# Plot data
+htm.plotting.plot(filtered_diffusivity)
+#plt.figure(figsize=(5, 2.7))
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.xlabel("1/T (K$^{-1}$)")
+plt.ylabel("Diffusivity (m$^{2}$ s$^{-1}$)")
+plt.yscale("log")
+plt.title("H/D/T diffusion in W")
+plt.show()
+```
+
+Uncertainty from this scatter is addressed via the ensemble approach - The TDS fitting is repeated with 5 different diffusivity datasets, spanning the upper bound, lower bound (excluding the outlier of Moore 1964), and 3 median/consensus sets. Values of the pre-exponential factor (D_O, in m^2^ s^-1^) and activation energy (E_D, in eV) for the 5 diffusion datasets are:
+
+```{python}
+# Query HTM for selected authors, filtering out extra datasets
+filtered_diffusivity = (
+    htm.diffusivities.filter(material=['tungsten'])
+    .filter(author=['byeon', 'fernandez', 'heinola', 'liu', 'zakharov'])
+    .filter(isotope=['h', 'd', 't'])
+    .filter(year=np.arange(1957, 2024, step=1).tolist())
+    .filter(exclude=True, note=["rolled_144um"])
+    .filter(exclude=True, note=["annealed_102um"])
+    .filter(exclude=True, note=["annealed_250um"])
+    .filter(exclude=True, note=["recrystallized_250um"])
+    .filter(exclude=True, year=2014)
+    .filter(exclude=True, note=["table 2 cr"]))
+
+# Expand weird htm format and make dataframe
+diffusivity = {
+    'author': [prop.author for prop in filtered_diffusivity],
+    'year': [prop.year for prop in filtered_diffusivity],
+    'pre_exp': [prop.pre_exp.magnitude for prop in filtered_diffusivity],
+    'act_energy': [prop.act_energy.magnitude for prop in filtered_diffusivity],
+    'isotope': [prop.isotope for prop in filtered_diffusivity],
+}
+
+diffusivity = pd.DataFrame(diffusivity)
+print(diffusivity)
+```
+
+N.B: Ensemble not currently implemented - using data of Liu 2016 for now. The data should probably be 
+
+## TDS data import
+
+
+TDS spectra taken from Fig. 7 of [@thoenSurfaceMorphologyDeuterium2014]. 4 samples of W were exposed to deuterium (D) plasmas. A low flux, low fluence, and high fluence... TDS data for low flux not reported, so not included in this analysis. A pre-damaged specimen ...  
+TODO: Summarise exposure conditions.
+
+FESTIM reports diffusion fluxes in mol m-2 s-1, but this paper reports a D desorption rate in 10^14 D2/s, so we need to divide desorpion rate by surface area to yield D2 m-2 s-1, then convert to mols. 
+
+Surface area reported by the paper as 1.7 cm^2^. Based on the plasma profile from Fig. 1 its assumed that the entire surface is implanted with D.
+
+
+
+
+
+
+```{python}
+import pandas as pd
+import matplotlib.pyplot as plt
+# Three CSV files in the working directory, low, high fluence, and a pre-damaged spectra. Units are in temperature (K) and D desorption rate in 10^14 D2/s
+
+colnames = ['T', 'Desorption_rate']
+
+low_TDS =  pd.read_csv("MHJtHoen_TDS_low_fluence.csv", names=colnames, header=None)
+high_TDS = pd.read_csv("MHJtHoen_TDS_high_fluence.csv",names=colnames, header=None)
+predam_TDS =  pd.read_csv("MHJtHoen_TDS_pre_damaged.csv", names=colnames, header=None)
+
+
+fig, ax = plt.subplots(figsize=(8, 6))
+
+# Line plot for each dataframe
+ax.plot(low_TDS['T'], low_TDS['Desorption_rate'], label='MHJtHoen_TDS_low_fluence', marker='o')
+ax.plot(high_TDS['T'], high_TDS['Desorption_rate'], label='MHJtHoen_TDS_high_fluence', marker='o')
+ax.plot(predam_TDS['T'], predam_TDS['Desorption_rate'], label='MHJtHoen_TDS_pre_damaged', marker='o')
+
+ax.set_xlabel('Temperature (K)')
+ax.set_ylabel('D Desorption rate 10^14 (D2 s-1)')
+ax.set_title('Line Plot')
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+```
+
+A linear ramp at 1 K s^-1^ from 300 K at $t = 0 s$ to 1300 K at $t = 1000 s$ was employed.
+
+```{python}
+# Define temperature function
+def temperature(t):
+    ramp = 1  # K/s
+    return 300 + ramp * t
+
+time = np.linspace(0, 1000, 20)
+temp = temperature(time)
+
+plt.figure(figsize=(6, 2.7), layout='constrained')
+plt.plot(time, temp, label='linear')  # Plot some data on the (implicit) 
+plt.xlabel('Time (s)')
+plt.ylabel('Temperature (K)')
+plt.title("Simple Plot")
+plt.legend()
+```
+
+
+# Setup: define TDS function
 ```{python}
 #| output: false
 
 # Import modules
 import festim as F
-import h_transport_materials as htm
-import numpy as np
 import sympy as sp
 
 # Define global constants
 avogadro = 6.02214076e23  # 1/mol
-
-# Define temperature function
-def temperature(t):
-    ramp = 5  # K/s
-    return 300 + ramp * t
 
 # Define TDS function
 def TDS(n, E_p):
@@ -55,16 +176,10 @@ def TDS(n, E_p):
     synthetic_TDS.mesh = F.Mesh1D(vertices)
     
     # Define material properties & traps/reactions
-    
-    D = (
-    htm.diffusivities.filter(material="tungsten")
-    .filter(isotope="h")
-    .filter(author="fernandez")[0]
-    )
-    
+       
     tungsten = F.Material(
-        D_0=D.pre_exp.magnitude,
-        E_D=D.act_energy.magnitude,
+        D_0 = diffusivity['pre_exp'][3],
+        E_D = diffusivity['act_energy'][3]
     )
 
     boundary_left = F.SurfaceSubdomain1D(id=1, x=0)
@@ -80,8 +195,8 @@ def TDS(n, E_p):
     trap_1_reaction = F.Reaction(
         reactant=[H, empty_trap],
         product=[trapped_species],
-        k_0=D.pre_exp.magnitude / (1.1e-10**2 * 6 * w_atom_density),
-        E_k=D.act_energy.magnitude,
+        k_0=diffusivity['pre_exp'][3] / (1.1e-10**2 * 6 * w_atom_density),
+        E_k=diffusivity['act_energy'][3],
         p_0=1e13,
         E_p=E_p,
         volume=volume_subdomain,
@@ -106,7 +221,7 @@ def TDS(n, E_p):
     synthetic_TDS.settings = F.Settings(
         atol=1e-10,
         rtol=1e-10,
-        final_time=140,
+        final_time=1000,
         max_iterations=50,
     )
 
@@ -141,7 +256,6 @@ reference_prms = [1e-2, 1.0]
 data = TDS(*reference_prms)
 
 import matplotlib.pyplot as plt
-
 
 # Calculate the total desorption flux
 flux_left = data[0].data
