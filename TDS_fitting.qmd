@@ -1,5 +1,5 @@
 ---
-title: "TDS fitting"
+title: "Integrated modelling of T retention in a JET divertor tile"
 format:
   html:
     code-fold: true
@@ -9,17 +9,313 @@ execute:
 bibliography: bibliography.bib
 ---
 
+```{python}
+#| output: false
+import subprocess
+import atexit
+import sys
+
+# Prevent CPU throttling while idle during document execution
+_inhibit_proc = None
+try:
+    _inhibit_proc = subprocess.Popen(
+        ["systemd-inhibit", "--what=idle", "--who=TDS_fitting",
+         "--why=Prevent CPU throttling during document execution", "sleep", "infinity"]
+    )
+    atexit.register(lambda: (_inhibit_proc.terminate(), _inhibit_proc.wait()))
+    print("systemd-inhibit started", file=sys.stderr)
+except FileNotFoundError:
+    print("systemd-inhibit not available, continuing without it...", file=sys.stderr)
+```
+
 # Introduction
+
+The objective is to estimate the retained tritium in a JET divertor tile via integrated implantation and transport modelling. This takes plasma diagnostics data from the JET data centre (JDC) and and models implantation in a tile using the binary collision approximation (RustBCA). Transport and outgassing in a JET component is modelled using the finite element method, using the FESTIM code.
+
+Aim is to eventually simulate:
+Bake out
+Strikepoint raising
+???
+
 Based on https://festim-workshop.readthedocs.io/en/festim2/content/applications/task10.html, which implements https://doi.org/10.1016/j.nme.2021.100984.
 
-A dummy TDS spectrum with artifical experimental noise is generated. Based on an initial guess, FESTIM simulations are conducted iteratively and compared against the dummy spectrum until a pre-defined error threshold is reached.
+# Method
 
-# Setup
+## A discussion on JET Diagnostics
+
+Objective is to pull ion flux (N~i~), ion temperature (T~i~), and component surface temperature (T~surf~) data from the JDC, for outer strikepoint tile 5 (bulk tungsten tile). Diagnostic candidates chosen from:
+https://jeu.jetdata.eu/documents/RefresherCourse2018/Tuesday/JETRefresherCourse2018_Bernardo_DiagnosticsandAnalysisTools.pdf
+
+### Ion Flux (N~i~)
+- KY4D: Divertor Langmuir probes. Electron temperature doesn't appear standard in ppF, Te from Langmuir can be produced upon request by Beth Thomas. ky4v (all probes combined) and individual probes (S + probe number).
+
+
+- Thomson scattering (Te, Ne)? Likely not for the divertor
+
+
+
+In detatched regime, divertor Langmuir probes are unreliable due to low eV?
+
+Can we assume Ne=Ni?
+
+
+### Ion temperature (T~i~)
+Can we assume Te=Ti? Probably not
+
+- KS3, KSR, KT3, KT7, KT1, KS8: Visible & UV spectroscopy. Specifically, KS3 and KT3 for the divertor. Balmer or Paschen lines can give Te in the divertor via edge ratio. The spectroscopy sees an entire chord. To find a good paper on this.
+
+### T~Surf~
+Temperature diagnostic candidates:
+
+- KD1D: divertor thermocouples (maybe slow response?)
+
+- KL3B, KL9B: mid-wavelength IR cameras
+
+- KLDT: new DT camera & pyrometer suite
+
+For now, we just define an arbitrary electron temperature (T_e), flux (n_e) and component surface temperature (T_surf).
+
+Can we assume plasma conditions on probe are same as tile?
+Access raw diagnostic data or processed pulse 
+
+Questions for Eugene:
+- Okay to focus on the divertor (tungsten)? Anna says Outer strikepoint tile 5
+- Is there a particular divertor tile or region that is well characterised from a retention aspect?
+- Any preference for outer or inner divertor target?
+- Diagnostics in divertor region? Langmuir probes, OES?
+- How to estimate incident particle flux, energy range, from diagnostic data? 
+
+
+## JET Data Centre (JDC) Data Extraction
+This code employs the simple access layer (SAL) of the JET Data Centre (JDC) to access JET diagnostic measurements. It requires three things to work: 
+
+1. the jet-sal-client-python package, from data.jet.uk/guides/sal/downloads.html
+1. an active VPN connection to vpn.jetdata.eu, port 943
+1. valid JDC credentials, stored in $HOME/.sal/credentials
+1. The following small patch to the sal.core.serialise command, used by sal.get(), which is incompatible with recent versions of numpy 
+
+```{python}
+import base64
+import numpy as np
+import sal.core.serialise as _serialise
+
+def _decode_array_fixed(d):
+    try:
+        encoding = d['encoding']
+        dtype = _serialise._TYPES_ID_TO_NUMPY[d['type']]
+        data = d['data']
+        shape = d['shape']
+    except KeyError:
+        raise _serialise.InternalError('Malformed array data found during de-serialisation.')
+
+    if encoding == 'base64':
+        return np.frombuffer(base64.b64decode(data), dtype=dtype).reshape(shape)
+
+    if encoding == 'list':
+        return np.array(data, dtype=dtype)
+
+    raise _serialise.InternalError('Unrecognised array encoding type found during de-serialisation.')
+
+_serialise._decode_array = _decode_array_fixed
+```
+
+ 
+
+Pulse 105541 from RT22-01 ITER baseline scenario:
+https://data.jetdata.eu/dashboard/pulses/105541/overview
+
+
+```{python}
+from jet.data import sal
+import matplotlib.pyplot as plt
+sal.authenticate()
+
+ni = sal.get('/pulse/87737/ppf/signal/jetppf/KY4D/JSUF')
+
+tsurf = sal.get('/pulse/105541/ppf/signal/jetppf/kldt-e5wc/divt7')
+
+print("ion flux and electron temperature at the divertor targets.")
+plt.subplot(1,2,1) # row 1, column 2, count 1
+plt.plot(ni.dimensions[0].data, ni.data)
+plt.title('ion flux (KY4D/JSUF)')
+plt.xlabel('time (s)')
+plt.ylabel('ions m-2')
+
+plt.subplot(1,2,2) # row 1, column 2, count 1
+print("Divertor surface temperature")
+plt.plot(tsurf.dimensions[0].data, tsurf.data)
+plt.title('Surface temp. (KLDT-E5WC/divt7)')
+plt.xlabel('time (s)')
+plt.ylabel('temp DegC')
+#plt.tight_layout(4)
+plt.show()
+
+# Placeholder, order-of-magnitude divertor values in the meantime
+flux = 1e22          # incident ion flux, m^-2 s^-1
+Te = 20.0            # electron temperature, eV
+T_surf = 400.0  # plasma-facing component temperature, K
+
+Ti = Te  # assumed equal to Te (see above)
+energy_eV = 2 * Te + 3 * Ti  # sheath-accelerated impact energy, eV
+```
+
+The JDC pull above does not currently return an ion temperature, so we assume $T_i = T_e$ — a common simplification in the SOL/divertor when only the electron temperature is diagnosed.
+
+Ions crossing the magnetic sheath are accelerated by the pre-sheath (Bohm, $\sim 0.5T_e$) and sheath ($\sim T_e \ln(\dots)$, here $\sim 2.5T_e$ for singly-charged D/H with secondary electron emission neglected) potential drops. This is commonly summarised as an impact energy of $E_\text{impact} \approx 2T_e + 3T_i$ [see e.g. Stangeby, *The Plasma Boundary of Magnetic Fusion Devices*], which with $T_i = T_e$ reduces to $E_\text{impact} \approx 5T_e$. This estimate is used below as the ion energy for the BCA calculation.
+
+
+# Implantation depth via Binary Collision Approximation (BCA)
+
+Define parameters
+
+```{python}
+from libRustBCA import *
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Structured on 100eV_H_in_W.toml (material/geometry parameters below match it
+# exactly) using libRustBCA's compound_bca_list_1D_py instead of writing a TOML
+# file and calling the RustBCA binary. Material values are taken directly from
+# the TOML (not from scripts/materials.py defaults, which differ slightly,
+# e.g. Es_H = 1.5 eV there vs 0.0 eV in this TOML). The ion energy, however, is
+# now the sheath-accelerated impact energy derived from Te above, not the
+# TOML's fixed 100 eV.
+#
+# Note: compound_bca_list_1D_py doesn't expose everything the TOML does -
+# displacement energies (Ed = [25, 25]), electronic_stopping_correction_factors,
+# and the surface/bulk binding models (PLANAR/AVERAGE) are fixed internally and
+# can't be set through this binding.
+
+# --- particle_parameters: N x energy_eV H (energy_eV set from Te above) ---
+N = 1000
+Z1_H = 1.0      # Z
+m1_H = 1.008    # m
+Ec1_H = 1.0     # Ec
+Es1_H = 0.0     # Es
+
+# dir = [0.999, 0.001, 0.0] in the TOML -> normalize to a unit vector
+dir_vec = np.array([0.999, 0.001, 0.0])
+dir_vec /= np.linalg.norm(dir_vec)
+
+ux = [dir_vec[0]] * N
+uy = [dir_vec[1]] * N
+uz = [dir_vec[2]] * N
+
+energies = [energy_eV] * N
+Z1 = [Z1_H] * N
+m1 = [m1_H] * N
+Ec1 = [Ec1_H] * N
+Es1 = [Es1_H] * N
+
+# --- material_parameters: species 0 = Ti, species 1 = W ---
+Z2 = [22.0, 74.0]
+m2 = [47.867, 183.84]
+Ec2 = [3.5, 1.0]
+Es2 = [4.89, 8.68]
+Eb2 = [3.0, 3.0]
+
+# --- geometry_input: 2-layer target, densities given per micron^3 in the TOML ---
+# layer 0: ~1 A Ti skin, layer 1: 50 micron W bulk
+A_PER_MICRON = 1e4
+densities_per_micron3 = [[5.664e10, 0.0], [0.0, 6.322e10]]
+layer_thicknesses_micron = [0.0001, 50.0]
+
+# convert to what the binding expects: densities in 1/Angstrom^3, thicknesses in Angstrom
+n2 = [[n / A_PER_MICRON**3 for n in layer] for layer in densities_per_micron3]
+dx = [t * A_PER_MICRON for t in layer_thicknesses_micron]
+
+```
+
+
+
+```{python}
+
+output, incident, stopped = compound_bca_list_1D_py(
+    ux, uy, uz, energies, Z1, m1, Ec1, Es1, Z2, m2, Ec2, Es2, Eb2, n2, dx
+)
+
+output = np.array(output)
+incident = np.array(incident)
+stopped = np.array(stopped)
+
+# output columns: [Z, m, E (eV), x, y, z (A), ux, uy, uz]
+reflected = incident & ~stopped   # incident H that left back out the front
+implanted = incident & stopped    # incident H that came to rest in the target
+sputtered = ~incident & ~stopped  # target recoils (Ti/W) that escaped
+
+print(f'{N} x {energy_eV} eV H -> Ti/W layered target')
+print(f'Reflected: {reflected.sum()} ({reflected.sum()/N:.3f})')
+print(f'Implanted: {implanted.sum()} ({implanted.sum()/N:.3f})')
+print(f'Sputtered: {sputtered.sum()} ({sputtered.sum()/N:.3f})')
+
+implanted_depth_A = output[implanted, 3]
+plt.figure(figsize=(8, 5))
+plt.hist(implanted_depth_A, bins=50, histtype='step')
+plt.xlabel('Implantation depth [A]')
+plt.ylabel('Counts')
+plt.title(f'Implanted H depth distribution ({energy_eV} eV)')
+plt.show()
+```
+
+
+```{python}
+
+import subprocess
+import tomllib
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Flag to rerun RustBCA or just read the output files
+runsim = True
+toml_path = "100eV_H_in_W.toml"
+toml_paths = [toml_path]
+
+if runsim:
+    RustBCA = "../rustbca/target/release/RustBCA"  # RustBCA binary path
+    os.makedirs("rustbca_output", exist_ok=True)
+    for toml_path in toml_paths:
+        subprocess.run([RustBCA, "1D", toml_path], check=True)
+
+deposited_list = []
+N_incident = 0
+for toml_path in toml_paths:
+  with open(toml_path, "rb") as f:
+    rustbca_input = tomllib.load(f)
+  out_prefix = rustbca_input["options"]["name"]
+
+  summary = pd.read_csv(f"{out_prefix}summary.output", index_col=False)
+  summary.columns = summary.columns.str.strip()
+  N_incident += int(summary["reflected"].iloc[0] + summary["sputtered"].iloc[0] + summary["deposited"].iloc[0])
+
+  deposited_list.append(pd.read_csv(
+      f"{out_prefix}deposited.output",
+      header=None,
+      names=["Z", "m", "x", "y", "z", "colisions"]
+  ))
+
+deposited = pd.concat(deposited_list)
+
+n, edges = np.histogram(deposited["x"], bins=100)
+dx = edges[1] - edges[0]
+dx_cm = dx * 1e-4  # µm -> cm
+f_x = n / (N_incident * dx_cm)
+
+fig, ax = plt.subplots()
+ax.bar(edges[:-1], f_x, width=dx, align="edge", edgecolor="black")
+ax.set_xlim(0, 0.1)
+ax.set_xlabel("Implantation depth x (µm)")
+ax.set_ylabel(r"Range distribution $f(x)$ (cm$^{-1}$)")
+ax.set_title("H implantation depth in W (100 eV)")
+plt.tight_layout()
+plt.show()
+```
+
 ## H/D/T in W diffusivity
  Arrehenius law diffusivity coefficents for H/D/T in W are taken from the hydrogen transport in materials (HTM) database [@delaporte-mathurin_remdelaportemathurinh-transport-materials_2023]. This compiles experimental, molecular dynamics (MD), and density functional theory (DFT) modelling literature data. Significant scatter is observed across HTM's 24 literature datasets for H/D/T diffusion in W:
 
 ```{python}
-
 import h_transport_materials as htm
 import matplotlib.pyplot as plt
 import numpy as np
@@ -73,25 +369,347 @@ diffusivity = pd.DataFrame(diffusivity)
 print(diffusivity)
 ```
 
-N.B: Ensemble not currently implemented - using data of Liu 2016 for now. The data should probably be 
+N.B: Ensemble not currently implemented - using data of Liu 2016 for now. To discuss/analyse the effects of scatter in this data on the results.
 
-## TDS data import
+```{python}
+import festim as F
+import ufl
+import pyvista
+from dolfinx import plot
+import matplotlib.pyplot as plt
+import numpy as np
+ 
+### TO INTRODUCE: MULTI-MATERIAL / INTERFACE, HEAT TRANSFER
+ 
+mesh = F.MeshFromXDMF(
+    volume_file="monoblock_mesh/mesh_domains.xdmf", facet_file="monoblock_mesh/mesh_boundaries.xdmf"
+)
+ 
+mesh.mesh.geometry.x[:] *= 1e-3  # mm to m
+ 
+# rotate to have z as the vertical axis
+mesh.mesh.geometry.x[:, [0, 1, 2]] = mesh.mesh.geometry.x[:, [0, 2, 1]]
+
+ct = mesh.define_volume_meshtags()
+ft = mesh.define_surface_meshtags()
+fdim = mesh.mesh.topology.dim - 1
+tdim = mesh.mesh.topology.dim
+
+pyvista.set_jupyter_backend("html")
+
+p = pyvista.Plotter(shape=(1, 3))
+p.subplot(0, 0)
+
+topology, cell_types, geometry = plot.vtk_mesh(mesh.mesh, tdim)
+grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
+
+p.add_mesh(grid, show_edges=True)
+p.camera.zoom("tight")
+
+p.view_vector((1, 1, 1))
 
 
-TDS spectra taken from Fig. 7 of [@thoenSurfaceMorphologyDeuterium2014]. 4 samples of W were exposed to deuterium (D) plasmas. A low flux, low fluence, and high fluence... TDS data for low flux not reported, so not included in this analysis. A pre-damaged specimen ...  
-TODO: Summarise exposure conditions.
-
-FESTIM reports diffusion fluxes in mol m-2 s-1, but this paper reports a D desorption rate in 10^14 D2/s, so we need to divide desorpion rate by surface area to yield D2 m-2 s-1, then convert to mols. 
-
-Surface area reported by the paper as 1.7 cm^2^. Based on the plasma profile from Fig. 1 its assumed that the entire surface is implanted with D.
+p.subplot(0, 1)
 
 
+mesh.mesh.topology.create_connectivity(fdim, tdim)
+topology, cell_types, x = plot.vtk_mesh(
+    mesh.mesh, tdim, ct.indices
+)
 
+grid = pyvista.UnstructuredGrid(topology, cell_types, x)
+grid.cell_data["Cell Marker"] = ct.values
+grid.set_active_scalars("Cell Marker")
+p.add_mesh(grid, show_edges=False)
+p.view_vector((1, 1, 1))
+
+
+p.subplot(0, 2)
+
+topology, cell_types, x = plot.vtk_mesh(
+    mesh.mesh, fdim, ft.indices
+)
+
+grid = pyvista.UnstructuredGrid(topology, cell_types, x)
+grid.cell_data["Facet Marker"] = ft.values
+grid.set_active_scalars("Facet Marker")
+p.add_mesh(grid, show_edges=False)
+p.view_vector((1, 1, 1))
+
+p.link_views()
+p.show_axes_all()
+if pyvista.OFF_SCREEN:
+    figure = p.screenshot("mb_mesh.png")
+p.show()
+```
+
+## Subdomains & materials
+```{python}
+
+tungsten = F.Material(
+    D_0=4.1e-7,
+    E_D=0.39,
+    K_S_0=1.87e24,
+    E_K_S=1.04,
+    thermal_conductivity=100,
+)
+ 
+copper = F.Material(
+    D_0=6.6e-7,
+    E_D=0.387,
+    K_S_0=3.14e24,
+    E_K_S=0.572,
+    thermal_conductivity=350,
+)
+ 
+cucrzr = F.Material(
+    D_0=3.92e-7,
+    E_D=0.418,
+    K_S_0=4.28e23,
+    E_K_S=0.387,
+    thermal_conductivity=350,
+)
+ 
+tungsten_volume = F.VolumeSubdomain(id=6, material=tungsten)
+copper_volume = F.VolumeSubdomain(id=7, material=copper)
+cucrzr_volume = F.VolumeSubdomain(id=8, material=cucrzr)
+ 
+top_surface = F.SurfaceSubdomain(id=9)
+cooling_surface = F.SurfaceSubdomain(id=10)
+poloidal_gap_w = F.SurfaceSubdomain(id=11)
+poloidal_gap_cu = F.SurfaceSubdomain(id=12)
+poloidal_gap_cucrzr = F.SurfaceSubdomain(id=13)
+toroidal_gap = F.SurfaceSubdomain(id=14)
+bottom = F.SurfaceSubdomain(id=15)
+ 
+all_subdomains = [
+    tungsten_volume,
+    copper_volume,
+    cucrzr_volume,
+    top_surface,
+    cooling_surface,
+    poloidal_gap_cu,
+    poloidal_gap_w,
+    poloidal_gap_cucrzr,
+    toroidal_gap,
+    bottom,
+]
+ 
+heat_transfer_problem = F.HeatTransferProblem()
+ 
+# Mesh and subdomains
+heat_transfer_problem.subdomains = all_subdomains
+heat_transfer_problem.mesh = mesh
+ 
+# Boundary conditions
+heat_flux_top = F.HeatFluxBC(subdomain=top_surface, value=10e6)
+ 
+h_convective = 7e04  # W/m^2/K
+T_coolant = 323  # K
+ 
+convective_flux_coolant = F.HeatFluxBC(
+    subdomain=cooling_surface, value=lambda T: h_convective * (T_coolant - T)
+)
+ 
+heat_transfer_problem.boundary_conditions = [heat_flux_top, convective_flux_coolant]
+ 
+# Exports
+heat_transfer_problem.exports = [F.VTXTemperatureExport("monoblock_results/heat_transfer_out.bp")]
+ 
+# Settings
+heat_transfer_problem.settings = F.Settings(
+    atol=1e-10,
+    rtol=1e-10,
+    transient=False,
+)
+ 
+# Run
+heat_transfer_problem.initialise()
+heat_transfer_problem.run()
+
+T = heat_transfer_problem.u
+
+topology, cell_types, geometry = plot.vtk_mesh(T.function_space)
+u_grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
+u_grid.point_data["T"] = T.x.array.real
+u_grid.set_active_scalars("T")
+u_plotter = pyvista.Plotter()
+u_plotter.add_mesh(u_grid, cmap="inferno", show_edges=False)
+# u_plotter.add_mesh(u_grid, style="wireframe", color="white", opacity=0.2)
+
+contours = u_grid.contour(9)
+u_plotter.add_mesh(contours, color="white")
+
+u_plotter.view_vector((1, 1, 1))
+
+if not pyvista.OFF_SCREEN:
+    u_plotter.show()
+else:
+    figure = u_plotter.screenshot("temperature.png")
+
+```
 
 
 
 ```{python}
+
+ 
+my_model = F.HydrogenTransportProblemDiscontinuous(
+    petsc_options={
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "pc_factor_mat_solver_type": "mumps",
+    }
+)
+my_model.method_interface = "penalty"
+
+my_model.subdomains = all_subdomains
+
+H = F.Species("H", subdomains=my_model.volume_subdomains)
+my_model.species = [H]
+
+my_model.mesh = mesh
+
+my_model.surface_to_volume = {
+    top_surface: tungsten_volume,
+    cooling_surface: cucrzr_volume,
+    poloidal_gap_w: tungsten_volume,
+    poloidal_gap_cu: copper_volume,
+    poloidal_gap_cucrzr: cucrzr_volume,
+    toroidal_gap: tungsten_volume,
+    bottom: tungsten_volume,
+}
+
+penalty_term = 1e20
+my_model.interfaces = [
+    F.Interface(
+        id=16, subdomains=(tungsten_volume, copper_volume), penalty_term=penalty_term
+    ),
+    F.Interface(
+        id=17, subdomains=(copper_volume, cucrzr_volume), penalty_term=penalty_term
+    ),
+]
+
+
+# Plasma implantation flux BC
+phi = 1.61e22
+R_p = 9.52e-10
+implantation_flux_top = F.FixedConcentrationBC(
+    subdomain=top_surface,
+    value=lambda T: phi * R_p / (tungsten.D_0 * ufl.exp(-tungsten.E_D / F.k_B / T)),
+    species=H,
+)
+
+# Instantaneous molecular recombination flux BCs at all other surfaces (fixed concentration of 0)
+recombination_fluxes = [
+    F.FixedConcentrationBC(subdomain=surf, value=0, species=H)
+    for surf in [
+        toroidal_gap,
+        bottom,
+        poloidal_gap_w,
+        poloidal_gap_cu,
+        poloidal_gap_cucrzr,
+        cooling_surface,
+    ]
+]
+
+my_model.boundary_conditions = [implantation_flux_top] + recombination_fluxes
+ 
+my_model.temperature = heat_transfer_problem.u
+ 
+exports = {
+    "poloidal_gap_cu_flux": F.SurfaceFlux(surface=poloidal_gap_cu, field=H),
+    "poloidal_gap_cucrzr_flux": F.SurfaceFlux(surface=poloidal_gap_cucrzr, field=H),
+    "poloidal_gap_w_flux": F.SurfaceFlux(surface=poloidal_gap_w, field=H),
+    "toroidal_gap_flux": F.SurfaceFlux(surface=toroidal_gap, field=H),
+    "bottom_flux": F.SurfaceFlux(surface=bottom, field=H),
+    "inventory_w": F.TotalVolume(field=H, volume=tungsten_volume),
+    "inventory_cu": F.TotalVolume(field=H, volume=copper_volume),
+    "inventory_cucrzr": F.TotalVolume(field=H, volume=cucrzr_volume),
+}
+
+
+my_model.exports = list(exports.values())
+
+my_model.settings = F.Settings(
+    atol=1e-8,
+    rtol=1e-10,
+    transient=False,
+    max_iterations=10,
+)
+ 
+my_model.initialise()
+my_model.run()
+
+p = pyvista.Plotter(shape=(1, 2))
+p.subplot(0, 0)
+
+for vol in my_model.volume_subdomains:
+    sol = H.subdomain_to_post_processing_solution[vol]
+
+    topology, cell_types, geometry = plot.vtk_mesh(sol.function_space)
+    u_grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
+    u_grid.point_data["c"] = sol.x.array.real
+    u_grid.set_active_scalars("c")
+    p.add_mesh(u_grid, cmap="viridis", show_edges=False)
+
+p.view_vector((0.5, -0.4, 0.3))
+
+
+p.subplot(0, 1)
+topology, cell_types, geometry = plot.vtk_mesh(heat_transfer_problem.u.function_space)
+u_grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
+u_grid.point_data["T"] = heat_transfer_problem.u.x.array.real
+u_grid.set_active_scalars("T")
+p.add_mesh(u_grid, cmap="inferno", show_edges=False)
+p.view_vector((0.5, -0.4, 0.3))
+
+p.link_views()
+p.show_axes_all()
+
+if not pyvista.OFF_SCREEN:
+    p.show()
+else:
+    figure = p.screenshot("concentration.png")
+```
+
+
+
+```{python}
+fig, axs = plt.subplots(nrows=2, ncols=1, figsize=(6, 12))
+
+plt.sca(axs[0])
+all_fluxes_vals = [np.abs(flux.data[0]) for flux in exports.values() if isinstance(flux, F.SurfaceFlux)]
+all_fluxes_labels = [name for name, flux in exports.items() if isinstance(flux, F.SurfaceFlux)]
+
+# sort
+all_fluxes_vals, all_fluxes_labels = zip(*sorted(zip(all_fluxes_vals, all_fluxes_labels)))
+
+plt.plot(all_fluxes_vals, all_fluxes_labels, marker="o", linestyle="--")
+plt.xlabel("Flux (absolute) (at. s$^{-1}$)")
+plt.xscale("log")
+plt.xlim(left=1e8)
+
+plt.sca(axs[1])
+all_inventories_vals = [inv.data[0] for inv in exports.values() if isinstance(inv, F.TotalVolume)]
+all_inventories_labels = [name for name, inv in exports.items() if isinstance(inv, F.TotalVolume)]
+plt.plot(all_inventories_vals, all_inventories_labels, marker="o", linestyle="--")
+plt.xlabel("Inventory (at.)")
+plt.xscale("log")
+plt.show()
+```
+
+## TDS data import
+
+TDS spectra for three samples were taken from Fig. 7 of [@thoenSurfaceMorphologyDeuterium2014]. This was converted from a desorption rate(molecules D2 s^-1^) to a flux (mol m^-2^ s^-1^), assuming approximately uniform implantiation across each sample's 1.7 cm^-2^ surface area (see fig. 1).
+
+TODO: Summarise exposure conditions.
+ Samples of W were exposed to deuterium (D) plasmas. A low flux, low fluence, and high fluence... TDS data for low flux not reported, so not included in this analysis. A pre-damaged specimen ...  
+
+
+```{python}
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 # Three CSV files in the working directory, low, high fluence, and a pre-damaged spectra. Units are in temperature (K) and D desorption rate in 10^14 D2/s
 
@@ -101,6 +719,14 @@ low_TDS =  pd.read_csv("MHJtHoen_TDS_low_fluence.csv", names=colnames, header=No
 high_TDS = pd.read_csv("MHJtHoen_TDS_high_fluence.csv",names=colnames, header=None)
 predam_TDS =  pd.read_csv("MHJtHoen_TDS_pre_damaged.csv", names=colnames, header=None)
 
+# This paper reports desorption rate in terms of 10^14 molecules of D2 s-1, whereas FESTIM calculates mol m-2 s-1. So we convert.
+
+a_cm2 = 1.7 # sample surface area in cm^-2
+a_m2 = a_cm2/np.square(100) # in m2
+
+low_TDS['Desorption_rate'] = (low_TDS['Desorption_rate']/a_m2)*(1e14/6.022e23)
+high_TDS['Desorption_rate'] = (high_TDS['Desorption_rate']/a_m2)*(1e14/6.022e23)
+predam_TDS['Desorption_rate'] = (predam_TDS['Desorption_rate']/a_m2)*(1e14/6.022e23)
 
 fig, ax = plt.subplots(figsize=(8, 6))
 
@@ -110,7 +736,7 @@ ax.plot(high_TDS['T'], high_TDS['Desorption_rate'], label='MHJtHoen_TDS_high_flu
 ax.plot(predam_TDS['T'], predam_TDS['Desorption_rate'], label='MHJtHoen_TDS_pre_damaged', marker='o')
 
 ax.set_xlabel('Temperature (K)')
-ax.set_ylabel('D Desorption rate 10^14 (D2 s-1)')
+ax.set_ylabel('D Desorption rate (D2 mol m-2 s-1)')
 ax.set_title('Line Plot')
 ax.legend()
 ax.grid(True, alpha=0.3)
@@ -151,12 +777,13 @@ import sympy as sp
 avogadro = 6.02214076e23  # 1/mol
 
 # Define TDS function
-def TDS(n, E_p):
+def TDS(n, E_p, fast=True):
     """Runs the simulation with parameters p that represent:
 
     Args:
         n (float): concentration of trap 1, at. fr.
         E_p (float): detrapping barrier from trap 1, eV
+        fast (bool): if True, use coarser mesh and looser tolerances for fitting
 
     Returns:
         F.DerivedQuantities: the derived quantities of the simulation
@@ -170,13 +797,14 @@ def TDS(n, E_p):
     H = F.Species("H")
     trapped_species = F.Species("H_trapped", mobile=False)
     synthetic_TDS.species = [H, trapped_species]
-    
+
     # Define a simple mesh
-    vertices = np.linspace(0, 20e-6, num=200)
+    n_vertices = 50 if fast else 200
+    vertices = np.linspace(0, 20e-6, num=n_vertices)
     synthetic_TDS.mesh = F.Mesh1D(vertices)
-    
+
     # Define material properties & traps/reactions
-       
+
     tungsten = F.Material(
         D_0 = diffusivity['pre_exp'][3],
         E_D = diffusivity['act_energy'][3]
@@ -203,7 +831,7 @@ def TDS(n, E_p):
     )
 
     synthetic_TDS.reactions = [trap_1_reaction]
-    
+
     # Define initial & boundary conditions
     synthetic_TDS.initial_conditions = [
         F.InitialConcentration(species=trapped_species, value=trap_conc, volume=volume_subdomain),
@@ -218,19 +846,21 @@ def TDS(n, E_p):
     synthetic_TDS.temperature = temperature
 
     # Define the simulation/solver settings
+    tol = 1e-6 if fast else 1e-10
     synthetic_TDS.settings = F.Settings(
-        atol=1e-10,
-        rtol=1e-10,
+        atol=tol,
+        rtol=tol,
         final_time=1000,
         max_iterations=50,
     )
 
+    max_step = (lambda t: None if t < 1 else 5) if fast else (lambda t: None if t < 1 else 1)
     synthetic_TDS.settings.stepsize = F.Stepsize(
         initial_value=0.01,
         growth_factor=1.2,
         cutback_factor=0.9,
         target_nb_iterations=4,
-        max_stepsize=lambda t: None if t < 1 else 1,
+        max_stepsize=max_step,
     )
 
     # Define derived quantities/outputs
@@ -249,7 +879,6 @@ def TDS(n, E_p):
 ```
 
 # Generate & display dummy TDS spectrum
-
 ```{python}
 
 reference_prms = [1e-2, 1.0]
@@ -284,18 +913,26 @@ plt.show()
 # Define fitting functions
 ```{python}
 #| output: false
+import time
 from scipy.interpolate import interp1d
 
 ref = np.genfromtxt("Noisy_TDS.csv", delimiter=";")
+#ref = low_TDS.to_numpy()
 
+_fit_start = time.time()
+_iter_start = time.time()
 
 def info(xk):
-    """
-    Print information during the fitting procedure
-    """
-    print("-" * 40)
-    print("New iteration.")
-    print(f"Point is: {xk}")
+    global _iter_start
+    elapsed = time.time() - _fit_start
+    iter_time = time.time() - _iter_start
+    best = min(errors) if errors else float("nan")
+    print(f"\n{'='*50}", file=sys.stderr, flush=True)
+    print(f"Iteration {i}  |  elapsed: {elapsed:.1f}s  |  iter: {iter_time:.1f}s", file=sys.stderr, flush=True)
+    print(f"  n   = {10**xk[0]:.4e}  (log10={xk[0]:.3f})", file=sys.stderr, flush=True)
+    print(f"  E_p = {xk[1]:.4f} eV", file=sys.stderr, flush=True)
+    print(f"  best error so far: {best:.3e}", file=sys.stderr, flush=True)
+    _iter_start = time.time()
 
 prms = []
 errors = []
@@ -305,11 +942,7 @@ all_fluxes = []
 
 i = 0  # initialise counter
 
-
 def error_function(prm):
-    """
-    Compute average absolute error between simulation and reference
-    """
     global i
     global prms
     global errors
@@ -319,13 +952,18 @@ def error_function(prm):
     i += 1
     prms.append(prm)
 
-    # Filter the results if a negative value is found
-    if any([e < 0 for e in prm]):
+    # Unpack log10(n) and E_p; n is fitted in log space so it can never go negative
+    log10_n, Ep = prm
+    n = 10 ** log10_n
+
+    if Ep < 0:
+        print(f"  eval {i}: negative E_p rejected", file=sys.stderr, flush=True)
         return 1e30
 
     # Get the simulation result
-    n, Ep = prm
-    res = TDS(n, Ep)
+    t0 = time.time()
+    res = TDS(n, Ep, fast=True)
+    sim_time = time.time() - t0
 
     flux = np.array(res[0].data) + np.array(res[1].data)
     all_fluxes.append(flux)
@@ -338,7 +976,7 @@ def error_function(prm):
     # Compute the mean absolute error between sim and ref
     err = np.abs(interp_tds(ref[:, 0]) - ref[:, 1]).mean()
 
-    print(f"Average absolute error is : {err:.2e}")
+    print(f"  eval {i}: n={n:.3e}, E_p={Ep:.4f} eV  →  err={err:.3e}  ({sim_time:.1f}s)", file=sys.stderr, flush=True)
     errors.append(err)
     return err
 ```
@@ -348,27 +986,32 @@ def error_function(prm):
 #| output: false
 from scipy.optimize import minimize
 
+# Initial guess informed by the low-fluence experimental data:
+# E_p ~ 1.56 eV from Redhead formula applied to T_peak ~ 554 K in the data
+# n ~ 1e-4 from integrating the TDS peak area (much lower than synthetic 1e-2)
+# n is fitted as log10(n) so both parameters are O(1) and the simplex is well-scaled
+initial_guess = [np.log10(1.2e-2), 1.00]  # [log10(n), E_p]
 
-# Set the tolerances
-fatol = 3e18
-xatol = 1e-2
-
-initial_guess = [2e-2, 1.1]
-
-# Minimise the error function
+# xatol: convergence when simplex diameter < 0.05 in log10(n) (~12% in n) and 0.05 eV in E_p
+# fatol: MAE in mol m-2 s-1; set tight relative to the signal (~1e-3 mol m-2 s-1)
 res = minimize(
     error_function,
     np.array(initial_guess),
     method="Nelder-Mead",
-    options={"disp": True, "fatol": fatol, "xatol": xatol},
+    options={"disp": True, "fatol": 1e-6, "xatol": 0.05},
     callback=info,
 )
 ```
 
 # Plot results
+
+The fitted trap concentration is `{python} f"{10**res.x[0]:.2e}"` and the
+detrapping energy is `{python} f"{res.x[1]:.2f}"` eV.
+
+
 ```{python}
-# Process the obtained results
-predicted_data = TDS(*res.x)
+# Process the obtained results — res.x is [log10(n), E_p], convert n back
+predicted_data = TDS(10 ** res.x[0], res.x[1])
 
 T = temperature(np.array(predicted_data[0].t))
 
@@ -377,11 +1020,11 @@ flux_right = predicted_data[1].data
 flux_total = np.array(flux_left) + np.array(flux_right)
 
 for i, (t, flux) in enumerate(zip(all_ts, all_fluxes)):
-    T = temperature(t)
+    T_iter = temperature(t)
     if i == 0:
-        plt.plot(T, flux, color="tab:red", lw=2, label="Initial guess")
+        plt.plot(T_iter, flux, color="tab:red", lw=2, label="Initial guess")
     else:
-        plt.plot(T, flux, color="tab:grey", lw=0.5)
+        plt.plot(T_iter, flux, color="tab:grey", lw=0.5)
 
 plt.plot(ref[:, 0], ref[:, 1], linewidth=2, label="Reference")
 plt.plot(T, flux_total, linewidth=2, label="Optimised")
@@ -392,3 +1035,11 @@ plt.legend()
 plt.show()
 ```
 
+```{python}
+#| output: false
+# Stop systemd-inhibit
+if _inhibit_proc is not None:
+    _inhibit_proc.terminate()
+    _inhibit_proc.wait()
+    print("systemd-inhibit stopped", file=sys.stderr)
+```

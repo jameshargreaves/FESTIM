@@ -1,0 +1,20 @@
+# Windows/WSL download metadata
+*:Zone.Identifier
+
+# Rendered Quarto output (regenerate from .qmd)
+*.html
+*_files/
+
+# Simulation data and results
+monoblock_mesh/
+monoblock_results/
+rustbca_output/
+
+# Internal / third-party
+openmc/
+jet_sal_client_v1.4.4/
+*.zip
+
+# Python / Jupyter
+__pycache__/
+.ipynb_checkpoints/

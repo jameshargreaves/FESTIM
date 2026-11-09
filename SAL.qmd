@@ -1,0 +1,11 @@
+---
+title: "Untitled"
+format: html
+jupyter: python3
+---
+
+```{python}
+from sal.client import SALClient
+sal = SALClient("https://sal.jetdata.eu")
+```
+sal.show('/pulse/87737/ppf/signal/jetppf/magn/ipla')
